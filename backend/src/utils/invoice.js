@@ -1,3 +1,6 @@
+const { Client } = require("../models");
+const { todayStr } = require("./dates");
+
 function round2(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
@@ -27,34 +30,63 @@ function computeTotals(items, taxRate = 0, discount = 0) {
 function effectiveStatus(invoice) {
   if (invoice.status === "paid") return "paid";
   if (invoice.status === "sent" && invoice.due_date) {
-    const due = new Date(invoice.due_date);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    if (due < today) return "overdue";
+    if (String(invoice.due_date).slice(0, 10) < todayStr()) return "overdue";
   }
   return invoice.status;
 }
 
-function serializeInvoice(row, items) {
+// `row` must already be cleaned (see utils/serialize.js)
+function serializeInvoice(row, withItems = false) {
+  const { items, ...rest } = row;
   const num = (v) => (v == null ? 0 : Number(v));
   const base = {
-    ...row,
-    tax_rate: num(row.tax_rate),
-    discount: num(row.discount),
-    subtotal: num(row.subtotal),
-    tax_amount: num(row.tax_amount),
-    total: num(row.total),
+    ...rest,
+    tax_rate: num(rest.tax_rate),
+    discount: num(rest.discount),
+    subtotal: num(rest.subtotal),
+    tax_amount: num(rest.tax_amount),
+    total: num(rest.total),
   };
   base.effective_status = effectiveStatus(base);
-  if (items) {
-    base.items = items.map((it) => ({
-      ...it,
-      quantity: num(it.quantity),
-      rate: num(it.rate),
-      amount: num(it.amount),
-    }));
+  if (withItems) {
+    base.items = (items || [])
+      .slice()
+      .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+      .map((it) => ({
+        ...it,
+        quantity: num(it.quantity),
+        rate: num(it.rate),
+        amount: num(it.amount),
+      }));
   }
   return base;
 }
 
-module.exports = { round2, computeTotals, effectiveStatus, serializeInvoice };
+// Adds client_name / client_company (and email + address when `full`)
+// to already-cleaned invoice rows. Replaces the old SQL LEFT JOIN.
+async function attachClients(rows, { full = false } = {}) {
+  const ids = [...new Set(rows.map((r) => r.client_id).filter(Boolean))];
+  const clients = ids.length
+    ? await Client.find({ _id: { $in: ids } }).lean()
+    : [];
+  const byId = new Map(clients.map((c) => [String(c._id), c]));
+
+  for (const r of rows) {
+    const c = r.client_id ? byId.get(String(r.client_id)) : null;
+    r.client_name = c ? c.name : null;
+    r.client_company = c ? c.company : null;
+    if (full) {
+      r.client_email = c ? c.email : null;
+      r.client_address = c ? c.address : null;
+    }
+  }
+  return rows;
+}
+
+module.exports = {
+  round2,
+  computeTotals,
+  effectiveStatus,
+  serializeInvoice,
+  attachClients,
+};

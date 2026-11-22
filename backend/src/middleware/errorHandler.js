@@ -10,24 +10,24 @@ function errorHandler(err, req, res, _next) {
   let message = err.message || "Internal server error";
   let details = err.details;
 
-  // PostgreSQL: unique constraint violation
-  if (err.code === "23505") {
+  // MongoDB: duplicate key (unique index)
+  if (err.code === 11000) {
     status = 409;
     message = "That value is already in use";
-    details = err.detail;
+    details = err.keyValue;
   }
 
-  // PostgreSQL: foreign key violation
-  else if (err.code === "23503") {
-    status = 400;
-    message = "Referenced record does not exist";
-    details = err.detail;
-  }
-
-  // PostgreSQL: invalid text representation
-  else if (err.code === "22P02") {
+  // Mongoose: invalid ObjectId / bad cast
+  else if (err.name === "CastError") {
     status = 400;
     message = "Invalid identifier";
+  }
+
+  // Mongoose: schema validation
+  else if (err.name === "ValidationError" && err.errors) {
+    status = 400;
+    message = "Validation failed";
+    details = Object.values(err.errors).map((e) => e.message);
   }
 
   // Zod validation error

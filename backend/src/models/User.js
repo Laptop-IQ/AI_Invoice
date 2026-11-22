@@ -1,7 +1,9 @@
 const bcrypt = require("bcrypt");
-const { query, queryOne } = require("../config/db");
+const { UserModel } = require("./index");
+const { clean } = require("../utils/serialize");
+const { isValidId } = require("../utils/ids");
 
-const PUBLIC_COLS = "id, email, name, created_at, updated_at";
+const PUBLIC_FIELDS = "email name created_at updated_at";
 
 function hashPassword(plain) {
   return bcrypt.hash(plain, 12);
@@ -11,44 +13,39 @@ function comparePassword(plain, hash) {
   return bcrypt.compare(plain, hash);
 }
 
+// Includes password_hash (used by login)
 async function findByEmail(email) {
-  return queryOne(`SELECT * FROM users WHERE email = $1`, [email]);
+  return clean(await UserModel.findOne({ email: String(email).toLowerCase() }).lean());
 }
 
 async function findById(id) {
-  return queryOne(`SELECT ${PUBLIC_COLS} FROM users WHERE id = $1`, [id]);
+  if (!isValidId(id)) return null;
+  return clean(await UserModel.findById(id).select(PUBLIC_FIELDS).lean());
 }
 
 async function findByIdWithHash(id) {
-  return queryOne(`SELECT * FROM users WHERE id = $1`, [id]);
+  if (!isValidId(id)) return null;
+  return clean(await UserModel.findById(id).lean());
 }
 
 async function create({ name, email, passwordHash }) {
-  return queryOne(
-    `INSERT INTO users (name, email, password_hash)
-     VALUES ($1, $2, $3)
-     RETURNING ${PUBLIC_COLS}`,
-    [name, email, passwordHash],
-  );
+  const doc = await UserModel.create({ name, email, password_hash: passwordHash });
+  return findById(doc._id);
 }
 
 async function updateName(id, name) {
-  return queryOne(
-    `UPDATE users SET name = $2, updated_at = now()
-     WHERE id = $1 RETURNING ${PUBLIC_COLS}`,
-    [id, name],
+  return clean(
+    await UserModel.findByIdAndUpdate(id, { $set: { name } }, { new: true })
+      .select(PUBLIC_FIELDS)
+      .lean(),
   );
 }
 
 async function updatePassword(id, passwordHash) {
-  await query(
-    `UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1`,
-    [id, passwordHash],
-  );
+  await UserModel.updateOne({ _id: id }, { $set: { password_hash: passwordHash } });
 }
 
 module.exports = {
-  PUBLIC_COLS,
   hashPassword,
   comparePassword,
   findByEmail,

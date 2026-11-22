@@ -1,5 +1,13 @@
-const { pool } = require("../src/config/db");
-const { SCHEMA_SQL } = require("../src/config/schema");
+const { connectDB, disconnectDB } = require("../src/config/db");
+const {
+  UserModel,
+  SettingsModel,
+  Client,
+  Invoice,
+  CatalogItem,
+  Expense,
+  Payment,
+} = require("../src/models");
 const User = require("../src/models/User");
 const Settings = require("../src/models/Settings");
 const { computeTotals } = require("../src/utils/invoice");
@@ -73,7 +81,7 @@ const STREETS = [
 const CATALOG = [
   ["Brand & UI design sprint", "One-week design engagement", 3200, "project"],
   ["Frontend development", "React / TypeScript build", 95, "hour"],
-  ["Backend API development", "Node / Postgres build", 110, "hour"],
+  ["Backend API development", "Node / Mongo build", 110, "hour"],
   [
     "Monthly retainer — support",
     "Ongoing support & maintenance",
@@ -101,7 +109,7 @@ const EXPENSE_VENDORS = [
   ["Linear", "Software", 8, 48],
   ["AWS", "Hosting", 80, 260],
   ["Vercel", "Hosting", 20, 150],
-  ["Neon", "Hosting", 19, 120],
+  ["MongoDB Atlas", "Hosting", 19, 120],
   ["Blue Bottle Coffee", "Meals", 8, 45],
   ["The Continental Bistro", "Meals", 40, 220],
   ["Chipotle", "Meals", 12, 60],
@@ -142,14 +150,14 @@ function phone() {
 
 async function run() {
   console.log(`\nSeeding demo data for ${DEMO.email}...\n`);
-  await pool.query(SCHEMA_SQL);
+  await connectDB();
 
   const passwordHash = await User.hashPassword(DEMO.password);
   let user = await User.findByEmail(DEMO.email);
   if (user) {
-    await pool.query(
-      `UPDATE users SET name=$2, password_hash=$3, updated_at=now() WHERE id=$1`,
-      [user.id, DEMO.name, passwordHash],
+    await UserModel.updateOne(
+      { _id: user.id },
+      { $set: { name: DEMO.name, password_hash: passwordHash } },
     );
     console.log(`User ready: ${DEMO.email} (existing)`);
   } else {
@@ -173,52 +181,55 @@ async function run() {
     invoice_prefix: "INV-",
   });
 
-  await pool.query(`DELETE FROM payments WHERE user_id=$1`, [uid]);
-  await pool.query(`DELETE FROM expenses WHERE user_id=$1`, [uid]);
-  await pool.query(`DELETE FROM catalog_items WHERE user_id=$1`, [uid]);
-  await pool.query(`DELETE FROM invoices WHERE user_id=$1`, [uid]);
-  await pool.query(`DELETE FROM clients WHERE user_id=$1`, [uid]);
+  await Promise.all([
+    Payment.deleteMany({ user_id: uid }),
+    Expense.deleteMany({ user_id: uid }),
+    CatalogItem.deleteMany({ user_id: uid }),
+    Invoice.deleteMany({ user_id: uid }),
+    Client.deleteMany({ user_id: uid }),
+  ]);
 
-  const clientIds = [];
+  const clientDocs = [];
   for (let i = 0; i < NUM_CLIENTS; i++) {
     const name = COMPANY_NAMES[i % COMPANY_NAMES.length];
     const company = name.replace(
       / (Group|Studios|Co\.?|Partners|Labs|Ventures|Interactive|Traders)$/i,
       "",
     );
-    const { rows } = await pool.query(
-      `INSERT INTO clients (user_id, name, email, company, phone, address)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [
-        uid,
-        name,
-        `billing@${slug(name)}.com`,
-        company,
-        phone(),
-        `${100 + rand(900)} ${pick(STREETS)}, ${pick(CITIES)}`,
-      ],
-    );
-    clientIds.push(rows[0].id);
+    clientDocs.push({
+      user_id: uid,
+      name,
+      email: `billing@${slug(name)}.com`,
+      company,
+      phone: phone(),
+      address: `${100 + rand(900)} ${pick(STREETS)}, ${pick(CITIES)}`,
+    });
   }
+  const clients = await Client.insertMany(clientDocs);
+  const clientIds = clients.map((c) => c._id);
   console.log(`Created ${clientIds.length} clients`);
 
-  for (const [name, description, rate, unit] of CATALOG) {
-    await pool.query(
-      `INSERT INTO catalog_items (user_id, name, description, rate, unit) VALUES ($1,$2,$3,$4,$5)`,
-      [uid, name, description, rate, unit],
-    );
-  }
+  await CatalogItem.insertMany(
+    CATALOG.map(([name, description, rate, unit]) => ({
+      user_id: uid,
+      name,
+      description,
+      rate,
+      unit,
+    })),
+  );
   console.log(`Created ${CATALOG.length} catalog items`);
 
   const today = new Date();
   let seq = 1;
   let paidCount = 0;
+  const invoiceDocs = [];
+  const paymentSpecs = [];
 
   for (let i = 0; i < NUM_INVOICES; i++) {
     const issueDaysAgo = rand(SPREAD_DAYS);
     const issue = isoDaysAgo(issueDaysAgo);
     const due = addDays(issue, [15, 30, 30, 45][rand(4)]);
-    const dueInFuture = new Date(due) >= today;
 
     const lineCount = 1 + rand(4);
     const items = [];
@@ -238,83 +249,74 @@ async function run() {
     else if (roll < 0.85) status = "sent";
     else status = "draft";
 
-    let paidAt = null;
+    let paidOn = null;
     if (status === "paid") {
       const paidDaysAgo = Math.max(
         0,
         issueDaysAgo - rand(Math.min(35, issueDaysAgo + 1)),
       );
-      paidAt = isoDaysAgo(paidDaysAgo);
+      paidOn = isoDaysAgo(paidDaysAgo);
       paidCount++;
     }
 
     const number = `INV-${String(seq).padStart(4, "0")}`;
     seq++;
 
-    const { rows } = await pool.query(
-      `INSERT INTO invoices
-        (user_id, client_id, invoice_number, status, issue_date, due_date,
-         currency, tax_rate, discount, subtotal, tax_amount, total, notes, terms, paid_at)
-       VALUES ($1,$2,$3,$4,$5,$6,'USD',$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-      [
-        uid,
-        pick(clientIds),
-        number,
-        status,
-        issue,
-        due,
-        taxRate,
-        totals.discount,
-        totals.subtotal,
-        totals.taxAmount,
-        totals.total,
-        "Thank you for your business.",
-        "Payment due within 30 days.",
-        paidAt,
-      ],
+    invoiceDocs.push({
+      user_id: uid,
+      client_id: pick(clientIds),
+      invoice_number: number,
+      status,
+      issue_date: issue,
+      due_date: due,
+      currency: "USD",
+      tax_rate: taxRate,
+      discount: totals.discount,
+      subtotal: totals.subtotal,
+      tax_amount: totals.taxAmount,
+      total: totals.total,
+      notes: "Thank you for your business.",
+      terms: "Payment due within 30 days.",
+      paid_at: paidOn ? new Date(paidOn) : null,
+      items: totals.items,
+    });
+    paymentSpecs.push(
+      status === "paid"
+        ? {
+            amount: totals.total,
+            method: pick(["Bank transfer", "Credit card", "Check", "PayPal"]),
+            paid_on: paidOn,
+          }
+        : null,
     );
-    const invId = rows[0].id;
-
-    let pos = 0;
-    for (const it of totals.items) {
-      await pool.query(
-        `INSERT INTO invoice_items (invoice_id, description, quantity, rate, amount, position)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [invId, it.description, it.quantity, it.rate, it.amount, pos++],
-      );
-    }
-
-    if (status === "paid") {
-      await pool.query(
-        `INSERT INTO payments (user_id, invoice_id, amount, method, paid_on, notes)
-         VALUES ($1,$2,$3,$4,$5,'')`,
-        [
-          uid,
-          invId,
-          totals.total,
-          pick(["Bank transfer", "Credit card", "Check", "PayPal"]),
-          paidAt,
-        ],
-      );
-    }
   }
-  await pool.query(`UPDATE company_settings SET next_seq=$2 WHERE user_id=$1`, [
-    uid,
-    seq,
-  ]);
-  console.log(
-    `Created ${NUM_INVOICES} invoices (${paidCount} paid + payments)`,
-  );
 
+  const invoices = await Invoice.insertMany(invoiceDocs);
+  const payments = [];
+  invoices.forEach((inv, idx) => {
+    const spec = paymentSpecs[idx];
+    if (spec) {
+      payments.push({ user_id: uid, invoice_id: inv._id, notes: "", ...spec });
+    }
+  });
+  await Payment.insertMany(payments);
+
+  await SettingsModel.updateOne({ user_id: uid }, { $set: { next_seq: seq } });
+  console.log(`Created ${NUM_INVOICES} invoices (${paidCount} paid + payments)`);
+
+  const expenseDocs = [];
   for (let i = 0; i < NUM_EXPENSES; i++) {
     const [vendor, category, min, max] = pick(EXPENSE_VENDORS);
-    const amount = round2(min + Math.random() * (max - min));
-    await pool.query(
-      `INSERT INTO expenses (user_id, vendor, category, expense_date, amount, notes)
-       VALUES ($1,$2,$3,$4,$5,'')`,
-      [uid, vendor, category, isoDaysAgo(rand(SPREAD_DAYS)), amount],
-    );
+    expenseDocs.push({
+      user_id: uid,
+      vendor,
+      category,
+      expense_date: isoDaysAgo(rand(SPREAD_DAYS)),
+      amount: round2(min + Math.random() * (max - min)),
+      notes: "",
+    });
   }
+  await Expense.insertMany(expenseDocs);
   console.log(`Created ${NUM_EXPENSES} expenses`);
 
   console.log("\n✅ Seed complete.");
@@ -328,5 +330,5 @@ run()
     process.exitCode = 1;
   })
   .finally(async () => {
-    await pool.end();
+    await disconnectDB();
   });

@@ -1,14 +1,16 @@
-const { pool } = require("../src/config/db");
-const { SCHEMA_SQL } = require("../src/config/schema");
+// MongoDB creates collections automatically; this just (re)builds indexes.
+const { connectDB, disconnectDB } = require("../src/config/db");
+const { mongoose } = require("../src/config/db");
 
 (async () => {
   try {
-    await pool.query(SCHEMA_SQL);
-    console.log("✅ Schema applied.");
+    await connectDB();
+    await Promise.all(Object.values(mongoose.models).map((m) => m.syncIndexes()));
+    console.log("✅ Indexes synced.");
   } catch (err) {
     console.error("❌ Migration failed:", err.message);
     process.exitCode = 1;
   } finally {
-    await pool.end();
+    await disconnectDB();
   }
 })();

@@ -2,8 +2,10 @@ const express = require("express");
 
 const asyncHandler = require("../utils/asyncHandler");
 const { requireAuth } = require("../middleware/auth");
-const { query, queryOne } = require("../config/db");
-const { serializeInvoice } = require("../utils/invoice");
+const { Invoice, Client } = require("../models");
+const { clean } = require("../utils/serialize");
+const { todayStr, monthKey, lastMonths } = require("../utils/dates");
+const { round2, serializeInvoice, attachClients } = require("../utils/invoice");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -12,73 +14,63 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const uid = req.user.id;
+    const today = todayStr();
+    const thisMonth = monthKey(today);
 
-    const totals = await queryOne(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) AS total_revenue,
-         COALESCE(SUM(CASE WHEN status <> 'paid' THEN total ELSE 0 END), 0) AS outstanding,
-         COALESCE(SUM(CASE WHEN status = 'paid'
-                      AND date_trunc('month', COALESCE(paid_at, issue_date))
-                        = date_trunc('month', CURRENT_DATE)
-                     THEN total ELSE 0 END), 0) AS paid_this_month,
-         COUNT(*) FILTER (WHERE status = 'sent' AND due_date < CURRENT_DATE)::int AS overdue_count,
-         COUNT(*)::int AS invoice_count,
-         COALESCE(SUM(CASE WHEN status = 'sent' AND due_date < CURRENT_DATE THEN total ELSE 0 END), 0) AS overdue_total
-       FROM invoices WHERE user_id = $1`,
-      [uid],
-    );
+    const [invoices, clientCount, recent] = await Promise.all([
+      Invoice.find({ user_id: uid })
+        .select("status total due_date issue_date paid_at")
+        .lean(),
+      Client.countDocuments({ user_id: uid }),
+      Invoice.find({ user_id: uid }).sort({ created_at: -1 }).limit(5).lean(),
+    ]);
 
-    const { rows: series } = await query(
-      `WITH months AS (
-         SELECT date_trunc('month', CURRENT_DATE) - (n || ' month')::interval AS m
-         FROM generate_series(0, 5) n
-       )
-       SELECT to_char(months.m, 'Mon') AS label,
-              to_char(months.m, 'YYYY-MM') AS ym,
-              COALESCE(SUM(i.total), 0) AS revenue,
-              COUNT(i.id)::int AS count
-       FROM months
-       LEFT JOIN invoices i
-         ON i.user_id = $1
-        AND i.status = 'paid'
-        AND date_trunc('month', COALESCE(i.paid_at, i.issue_date)) = months.m
-       GROUP BY months.m
-       ORDER BY months.m ASC`,
-      [uid],
-    );
+    let totalRevenue = 0;
+    let outstanding = 0;
+    let paidThisMonth = 0;
+    let overdueCount = 0;
+    let overdueTotal = 0;
 
-    const { rows: recentRows } = await query(
-      `SELECT i.*, c.name AS client_name, c.company AS client_company
-       FROM invoices i
-       LEFT JOIN clients c ON c.id = i.client_id
-       WHERE i.user_id = $1
-       ORDER BY i.created_at DESC
-       LIMIT 5`,
-      [uid],
-    );
+    for (const inv of invoices) {
+      const t = inv.total || 0;
+      if (inv.status === "paid") {
+        totalRevenue += t;
+        if (monthKey(inv.paid_at || inv.issue_date) === thisMonth) paidThisMonth += t;
+      } else {
+        outstanding += t;
+      }
+      if (inv.status === "sent" && inv.due_date && inv.due_date < today) {
+        overdueCount += 1;
+        overdueTotal += t;
+      }
+    }
 
-    const clientCount = await queryOne(
-      `SELECT COUNT(*)::int AS n FROM clients WHERE user_id = $1`,
-      [uid],
-    );
+    const revenueSeries = lastMonths(6).map((m) => {
+      const paid = invoices.filter(
+        (i) => i.status === "paid" && monthKey(i.paid_at || i.issue_date) === m.key,
+      );
+      return {
+        label: m.label,
+        ym: m.key,
+        revenue: round2(paid.reduce((s, i) => s + (i.total || 0), 0)),
+        count: paid.length,
+      };
+    });
+
+    const recentInvoices = await attachClients(clean(recent));
 
     res.json({
       stats: {
-        totalRevenue: Number(totals.total_revenue),
-        outstanding: Number(totals.outstanding),
-        paidThisMonth: Number(totals.paid_this_month),
-        overdueCount: totals.overdue_count,
-        overdueTotal: Number(totals.overdue_total),
-        invoiceCount: totals.invoice_count,
-        clientCount: clientCount.n,
+        totalRevenue: round2(totalRevenue),
+        outstanding: round2(outstanding),
+        paidThisMonth: round2(paidThisMonth),
+        overdueCount,
+        overdueTotal: round2(overdueTotal),
+        invoiceCount: invoices.length,
+        clientCount,
       },
-      revenueSeries: series.map((r) => ({
-        label: r.label,
-        ym: r.ym,
-        revenue: Number(r.revenue),
-        count: r.count,
-      })),
-      recentInvoices: recentRows.map((r) => serializeInvoice(r)),
+      revenueSeries,
+      recentInvoices: recentInvoices.map((r) => serializeInvoice(r)),
     });
   }),
 );

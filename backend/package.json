@@ -1,7 +1,7 @@
 {
   "name": "ai-invoice-manager-backend",
   "version": "0.1.0",
-  "description": "Backend for the AI Invoice & Billing Manager — clients, invoices, revenue stats, and Gemini AI features (PERN)",
+  "description": "Backend for the AI Invoice & Billing Manager — clients, invoices, revenue stats, and Gemini AI features (MERN)",
   "main": "src/server.js",
   "type": "commonjs",
   "engines": {
@@ -24,9 +24,9 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.5.2",
     "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.9.5",
     "morgan": "^1.10.1",
     "multer": "^2.1.1",
-    "pg": "^8.13.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

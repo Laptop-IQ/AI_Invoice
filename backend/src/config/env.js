@@ -3,7 +3,7 @@ const path = require("path");
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
-const required = ["DATABASE_URL", "JWT_SECRET"];
+const required = ["JWT_SECRET"];
 const missing = required.filter((key) => !process.env[key]);
 
 if (missing.length) {
@@ -14,7 +14,7 @@ if (missing.length) {
 module.exports = {
   nodeEnv: process.env.NODE_ENV || "development",
   port: Number(process.env.PORT) || 8000,
-  databaseUrl: process.env.DATABASE_URL,
+  mongodbUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/ai_invoice",
   jwtSecret: process.env.JWT_SECRET,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || "7d",
   cookieName: process.env.COOKIE_NAME || "ai_invoice_token",

@@ -1,14 +1,16 @@
 const express = require("express");
-const { pool } = require("../config/db");
+const { mongoose } = require("../config/db");
 
 const router = express.Router();
 
 router.get("/", async (req, res) => {
-  let db = "unknown";
+  let db = "disconnected";
 
   try {
-    await pool.query("SELECT 1");
-    db = "connected";
+    if (mongoose.connection.readyState === 1) {
+      await mongoose.connection.db.command({ ping: 1 });
+      db = "connected";
+    }
   } catch (err) {
     db = "disconnected";
   }

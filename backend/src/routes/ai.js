@@ -7,7 +7,10 @@ const { requireAuth } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
 const { uploadReceipt } = require("../middleware/upload");
 const { aiLimiter } = require("../middleware/rateLimit");
-const { query, queryOne } = require("../config/db");
+const { Invoice, Client } = require("../models");
+const { objectId } = require("../utils/ids");
+const { todayStr, monthKey, daysBetween } = require("../utils/dates");
+const { round2 } = require("../utils/invoice");
 const Settings = require("../models/Settings");
 const gemini = require("../services/geminiService");
 
@@ -32,36 +35,46 @@ router.post(
   aiLimiter,
   asyncHandler(async (req, res) => {
     const uid = req.user.id;
-    const rows = await queryOne(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status='paid' AND date_trunc('month',COALESCE(paid_at,issue_date))=date_trunc('month',CURRENT_DATE) THEN total ELSE 0 END),0) AS revenue_this_month,
-         COALESCE(SUM(CASE WHEN status='paid' AND date_trunc('month',COALESCE(paid_at,issue_date))=date_trunc('month',CURRENT_DATE - interval '1 month') THEN total ELSE 0 END),0) AS revenue_last_month,
-         COALESCE(SUM(CASE WHEN status<>'paid' THEN total ELSE 0 END),0) AS outstanding,
-         COUNT(*) FILTER (WHERE status='sent' AND due_date < CURRENT_DATE)::int AS overdue_count,
-         COALESCE(SUM(CASE WHEN status='sent' AND due_date < CURRENT_DATE THEN total ELSE 0 END),0) AS overdue_total
-       FROM invoices WHERE user_id = $1`,
-      [uid],
+    const today = todayStr();
+    const now = new Date();
+    const thisMonth = monthKey(today);
+    const lastMonth = monthKey(
+      todayStr(new Date(now.getFullYear(), now.getMonth() - 1, 1)),
     );
 
-    const { rows: topOverdue } = await query(
-      `SELECT c.name AS client, i.invoice_number, i.total, (CURRENT_DATE - i.due_date) AS days_overdue
-       FROM invoices i LEFT JOIN clients c ON c.id = i.client_id
-       WHERE i.user_id = $1 AND i.status='sent' AND i.due_date < CURRENT_DATE
-       ORDER BY i.total DESC LIMIT 3`,
-      [uid],
+    const invoices = await Invoice.find({ user_id: uid })
+      .select("status total due_date issue_date paid_at invoice_number client_id")
+      .lean();
+
+    const paidIn = (key) =>
+      invoices
+        .filter((i) => i.status === "paid" && monthKey(i.paid_at || i.issue_date) === key)
+        .reduce((s, i) => s + (i.total || 0), 0);
+    const overdue = invoices.filter(
+      (i) => i.status === "sent" && i.due_date && i.due_date < today,
     );
+
+    const top = overdue.sort((a, b) => b.total - a.total).slice(0, 3);
+    const clientDocs = top.length
+      ? await Client.find({ _id: { $in: top.map((i) => i.client_id).filter(Boolean) } })
+          .select("name")
+          .lean()
+      : [];
+    const names = new Map(clientDocs.map((c) => [String(c._id), c.name]));
 
     const data = {
-      revenueThisMonth: Number(rows.revenue_this_month),
-      revenueLastMonth: Number(rows.revenue_last_month),
-      outstanding: Number(rows.outstanding),
-      overdueCount: rows.overdue_count,
-      overdueTotal: Number(rows.overdue_total),
-      topOverdue: topOverdue.map((r) => ({
-        client: r.client,
-        invoice: r.invoice_number,
-        amount: Number(r.total),
-        daysOverdue: r.days_overdue,
+      revenueThisMonth: round2(paidIn(thisMonth)),
+      revenueLastMonth: round2(paidIn(lastMonth)),
+      outstanding: round2(
+        invoices.filter((i) => i.status !== "paid").reduce((s, i) => s + (i.total || 0), 0),
+      ),
+      overdueCount: overdue.length,
+      overdueTotal: round2(overdue.reduce((s, i) => s + (i.total || 0), 0)),
+      topOverdue: top.map((i) => ({
+        client: i.client_id ? names.get(String(i.client_id)) || null : null,
+        invoice: i.invoice_number,
+        amount: Number(i.total),
+        daysOverdue: daysBetween(today, i.due_date),
       })),
     };
 
@@ -75,18 +88,23 @@ router.post(
   aiLimiter,
   validate(
     z.object({
-      invoiceId: z.string().uuid(),
+      invoiceId: objectId,
       tone: z.enum(["friendly", "firm", "final"]).default("friendly"),
     }),
   ),
   asyncHandler(async (req, res) => {
-    const invoice = await queryOne(
-      `SELECT i.*, c.name AS client_name, c.email AS client_email, c.company AS client_company
-       FROM invoices i LEFT JOIN clients c ON c.id = i.client_id
-       WHERE i.id = $1 AND i.user_id = $2`,
-      [req.body.invoiceId, req.user.id],
-    );
+    const invoice = await Invoice.findOne({
+      _id: req.body.invoiceId,
+      user_id: req.user.id,
+    }).lean();
     if (!invoice) throw ApiError.notFound("Invoice not found");
+
+    const clientDoc = invoice.client_id
+      ? await Client.findById(invoice.client_id).lean()
+      : null;
+    invoice.client_name = clientDoc ? clientDoc.name : null;
+    invoice.client_email = clientDoc ? clientDoc.email : null;
+    invoice.client_company = clientDoc ? clientDoc.company : null;
 
     const settings = await Settings.ensure(req.user.id);
     const daysOverdue = invoice.due_date

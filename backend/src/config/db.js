@@ -1,59 +1,28 @@
-const { Pool } = require("pg");
+const mongoose = require("mongoose");
 const env = require("./env");
-const { SCHEMA_SQL } = require("./schema");
 
-const pool = new Pool({
-  connectionString: env.databaseUrl,
-  ssl: { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 10_000,
-});
+mongoose.set("strictQuery", true);
 
-pool.on("error", (err) => {
-  console.error("Postgres pool error:", err.message);
-});
-
-async function query(text, params) {
-  return pool.query(text, params);
-}
-
-async function queryOne(text, params) {
-  const { rows } = await pool.query(text, params);
-  return rows[0] || null;
-}
-
-async function withTransaction(fn) {
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const result = await fn(client);
-
-    await client.query("COMMIT");
-
-    return result;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
-}
+// Make sure every model is registered (so indexes get built on connect)
+require("../models");
 
 async function connectDB() {
-  const { rows } = await pool.query("SELECT current_database() AS db");
+  await mongoose.connect(env.mongodbUri, {
+    serverSelectionTimeoutMS: 10_000,
+    maxPoolSize: 10,
+  });
 
-  await pool.query(SCHEMA_SQL);
+  await Promise.all(Object.values(mongoose.models).map((m) => m.init()));
 
-  console.log(`Postgres connected: ${rows[0].db} (schema ready)`);
+  console.log(`MongoDB connected: ${mongoose.connection.name}`);
 }
 
-module.exports = {
-  pool,
-  query,
-  queryOne,
-  withTransaction,
-  connectDB,
-};
+async function disconnectDB() {
+  await mongoose.disconnect();
+}
+
+mongoose.connection.on("error", (err) => {
+  console.error("MongoDB error:", err.message);
+});
+
+module.exports = { mongoose, connectDB, disconnectDB };

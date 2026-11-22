@@ -2,7 +2,9 @@ const express = require("express");
 
 const asyncHandler = require("../utils/asyncHandler");
 const { requireAuth } = require("../middleware/auth");
-const { query, queryOne } = require("../config/db");
+const { Invoice, Expense, Client } = require("../models");
+const { todayStr, monthKey, lastMonths, daysBetween } = require("../utils/dates");
+const { round2 } = require("../utils/invoice");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -13,101 +15,95 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const uid = req.user.id;
+    const today = todayStr();
 
-    const totals = await queryOne(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status='paid' THEN total ELSE 0 END),0) AS revenue,
-         COALESCE(SUM(CASE WHEN status<>'paid' THEN total ELSE 0 END),0) AS outstanding,
-         COUNT(*)::int AS invoice_count
-       FROM invoices WHERE user_id = $1`,
-      [uid],
-    );
-    const exp = await queryOne(
-      `SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE user_id = $1`,
-      [uid],
-    );
+    const [invoices, expenses] = await Promise.all([
+      Invoice.find({ user_id: uid })
+        .select("status total due_date issue_date paid_at client_id")
+        .lean(),
+      Expense.find({ user_id: uid }).select("amount expense_date").lean(),
+    ]);
 
-    const { rows: monthly } = await query(
-      `WITH months AS (
-         SELECT date_trunc('month', CURRENT_DATE) - (n || ' month')::interval AS m
-         FROM generate_series(0,5) n
-       )
-       SELECT to_char(months.m,'Mon') AS label, to_char(months.m,'YYYY-MM') AS ym,
-         COALESCE((SELECT SUM(i.total) FROM invoices i
-            WHERE i.user_id=$1 AND i.status='paid'
-              AND date_trunc('month',COALESCE(i.paid_at,i.issue_date))=months.m),0) AS revenue,
-         COALESCE((SELECT SUM(e.amount) FROM expenses e
-            WHERE e.user_id=$1 AND date_trunc('month',e.expense_date)=months.m),0) AS expenses
-       FROM months ORDER BY months.m ASC`,
-      [uid],
-    );
+    const isOverdue = (i) => i.status === "sent" && i.due_date && i.due_date < today;
+    const sum = (list, fn = (i) => i.total) => round2(list.reduce((s, i) => s + num(fn(i)), 0));
 
-    const aging = await queryOne(
-      `SELECT
-         COALESCE(SUM(CASE WHEN due_date IS NULL OR due_date >= CURRENT_DATE THEN total ELSE 0 END),0) AS current,
-         COALESCE(SUM(CASE WHEN CURRENT_DATE - due_date BETWEEN 1 AND 30 THEN total ELSE 0 END),0) AS d30,
-         COALESCE(SUM(CASE WHEN CURRENT_DATE - due_date BETWEEN 31 AND 60 THEN total ELSE 0 END),0) AS d60,
-         COALESCE(SUM(CASE WHEN CURRENT_DATE - due_date BETWEEN 61 AND 90 THEN total ELSE 0 END),0) AS d90,
-         COALESCE(SUM(CASE WHEN CURRENT_DATE - due_date > 90 THEN total ELSE 0 END),0) AS d90plus
-       FROM invoices WHERE user_id = $1 AND status = 'sent'`,
-      [uid],
-    );
+    const revenue = sum(invoices.filter((i) => i.status === "paid"));
+    const outstanding = sum(invoices.filter((i) => i.status !== "paid"));
+    const expensesTotal = sum(expenses, (e) => e.amount);
 
-    const { rows: topClients } = await query(
-      `SELECT c.id, c.name,
-         COALESCE(SUM(i.total),0) AS billed,
-         COALESCE(SUM(CASE WHEN i.status='paid' THEN i.total ELSE 0 END),0) AS paid
-       FROM clients c JOIN invoices i ON i.client_id = c.id
-       WHERE c.user_id = $1
-       GROUP BY c.id ORDER BY billed DESC LIMIT 5`,
-      [uid],
-    );
+    const monthly = lastMonths(6).map((m) => ({
+      label: m.label,
+      ym: m.key,
+      revenue: sum(
+        invoices.filter((i) => i.status === "paid" && monthKey(i.paid_at || i.issue_date) === m.key),
+      ),
+      expenses: sum(
+        expenses.filter((e) => e.expense_date.slice(0, 7) === m.key),
+        (e) => e.amount,
+      ),
+    }));
 
-    const status = await queryOne(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status='draft' THEN total ELSE 0 END),0) AS draft,
-         COALESCE(SUM(CASE WHEN status='sent' AND (due_date IS NULL OR due_date>=CURRENT_DATE) THEN total ELSE 0 END),0) AS sent,
-         COALESCE(SUM(CASE WHEN status='sent' AND due_date<CURRENT_DATE THEN total ELSE 0 END),0) AS overdue,
-         COALESCE(SUM(CASE WHEN status='paid' THEN total ELSE 0 END),0) AS paid
-       FROM invoices WHERE user_id = $1`,
-      [uid],
-    );
+    // Aging of sent (unpaid) invoices by days past due
+    const aging = { current: 0, d30: 0, d60: 0, d90: 0, d90plus: 0 };
+    for (const i of invoices.filter((x) => x.status === "sent")) {
+      const days = i.due_date ? daysBetween(today, i.due_date) : 0;
+      const t = num(i.total);
+      if (days < 1) aging.current += t;
+      else if (days <= 30) aging.d30 += t;
+      else if (days <= 60) aging.d60 += t;
+      else if (days <= 90) aging.d90 += t;
+      else aging.d90plus += t;
+    }
 
-    const revenue = num(totals.revenue);
-    const expenses = num(exp.total);
+    // Top clients
+    const byClient = new Map();
+    for (const i of invoices) {
+      if (!i.client_id) continue;
+      const key = String(i.client_id);
+      const c = byClient.get(key) || { billed: 0, paid: 0 };
+      c.billed += num(i.total);
+      if (i.status === "paid") c.paid += num(i.total);
+      byClient.set(key, c);
+    }
+    const top = [...byClient.entries()].sort((a, b) => b[1].billed - a[1].billed).slice(0, 5);
+    const clientDocs = top.length
+      ? await Client.find({ _id: { $in: top.map(([id]) => id) } }).select("name").lean()
+      : [];
+    const names = new Map(clientDocs.map((c) => [String(c._id), c.name]));
+
+    const statusSum = (fn) => sum(invoices.filter(fn));
 
     res.json({
       totals: {
         revenue,
-        expenses,
-        netProfit: Math.round((revenue - expenses) * 100) / 100,
-        outstanding: num(totals.outstanding),
-        invoiceCount: totals.invoice_count,
+        expenses: expensesTotal,
+        netProfit: round2(revenue - expensesTotal),
+        outstanding,
+        invoiceCount: invoices.length,
       },
-      monthly: monthly.map((m) => ({
-        label: m.label,
-        ym: m.ym,
-        revenue: num(m.revenue),
-        expenses: num(m.expenses),
-      })),
+      monthly,
       aging: [
-        { bucket: "Current", value: num(aging.current) },
-        { bucket: "1–30d", value: num(aging.d30) },
-        { bucket: "31–60d", value: num(aging.d60) },
-        { bucket: "61–90d", value: num(aging.d90) },
-        { bucket: "90d+", value: num(aging.d90plus) },
+        { bucket: "Current", value: round2(aging.current) },
+        { bucket: "1–30d", value: round2(aging.d30) },
+        { bucket: "31–60d", value: round2(aging.d60) },
+        { bucket: "61–90d", value: round2(aging.d90) },
+        { bucket: "90d+", value: round2(aging.d90plus) },
       ],
-      topClients: topClients.map((c) => ({
-        id: c.id,
-        name: c.name,
-        billed: num(c.billed),
-        paid: num(c.paid),
+      topClients: top.map(([id, c]) => ({
+        id,
+        name: names.get(id) || "Unknown",
+        billed: round2(c.billed),
+        paid: round2(c.paid),
       })),
       statusBreakdown: [
-        { name: "Draft", value: num(status.draft), key: "draft" },
-        { name: "Sent", value: num(status.sent), key: "sent" },
-        { name: "Overdue", value: num(status.overdue), key: "overdue" },
-        { name: "Paid", value: num(status.paid), key: "paid" },
+        { name: "Draft", value: statusSum((i) => i.status === "draft"), key: "draft" },
+        {
+          name: "Sent",
+          value: statusSum((i) => i.status === "sent" && !isOverdue(i)),
+          key: "sent",
+        },
+        { name: "Overdue", value: statusSum(isOverdue), key: "overdue" },
+        { name: "Paid", value: statusSum((i) => i.status === "paid"), key: "paid" },
       ],
     });
   }),

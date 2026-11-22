@@ -5,20 +5,23 @@ const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { requireAuth } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
-const { query, queryOne, withTransaction } = require("../config/db");
+const { Payment, Invoice } = require("../models");
+const { clean } = require("../utils/serialize");
+const { objectId } = require("../utils/ids");
+const { todayStr, monthKey } = require("../utils/dates");
+const { round2, attachClients } = require("../utils/invoice");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const uuid = z.string().uuid("Invalid id");
-const idParam = z.object({ id: uuid });
+const idParam = z.object({ id: objectId });
 const dateStr = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD")
   .optional();
 
 const paymentSchema = z.object({
-  invoiceId: uuid,
+  invoiceId: objectId,
   amount: z.coerce.number().min(0.01).max(100_000_000),
   method: z.string().trim().max(40).optional(),
   paid_on: dateStr,
@@ -27,59 +30,63 @@ const paymentSchema = z.object({
 
 const num = (v) => Number(v) || 0;
 
-async function reconcileInvoice(client, invoiceId) {
-  const { rows } = await client.query(
-    `SELECT i.total,
-            COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id = i.id),0) AS paid
-     FROM invoices i WHERE i.id = $1`,
-    [invoiceId],
-  );
-  if (!rows[0]) return;
-  const { total, paid } = rows[0];
-  if (num(paid) >= num(total) && num(total) > 0) {
-    await client.query(
-      `UPDATE invoices SET status='paid', paid_at=COALESCE(paid_at, now()), updated_at=now() WHERE id=$1`,
-      [invoiceId],
+// Marks the invoice paid once payments cover the total; reverts if they no longer do.
+async function reconcileInvoice(invoiceId) {
+  const inv = await Invoice.findById(invoiceId).lean();
+  if (!inv) return;
+
+  const [agg] = await Payment.aggregate([
+    { $match: { invoice_id: inv._id } },
+    { $group: { _id: null, paid: { $sum: "$amount" } } },
+  ]);
+  const paid = round2(agg ? agg.paid : 0);
+  const total = round2(inv.total);
+
+  if (paid >= total && total > 0) {
+    await Invoice.updateOne(
+      { _id: inv._id },
+      { $set: { status: "paid", paid_at: inv.paid_at || new Date() } },
     );
-  } else {
-    await client.query(
-      `UPDATE invoices SET status = CASE WHEN status='paid' THEN 'sent' ELSE status END,
-              paid_at = CASE WHEN status='paid' THEN NULL ELSE paid_at END,
-              updated_at = now()
-       WHERE id = $1`,
-      [invoiceId],
-    );
+  } else if (inv.status === "paid") {
+    await Invoice.updateOne({ _id: inv._id }, { $set: { status: "sent", paid_at: null } });
   }
 }
 
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { rows } = await query(
-      `SELECT p.*, i.invoice_number, i.total AS invoice_total, c.name AS client_name
-       FROM payments p
-       JOIN invoices i ON i.id = p.invoice_id
-       LEFT JOIN clients c ON c.id = i.client_id
-       WHERE p.user_id = $1
-       ORDER BY p.paid_on DESC, p.created_at DESC`,
-      [req.user.id],
+    const rows = clean(
+      await Payment.find({ user_id: req.user.id })
+        .sort({ paid_on: -1, created_at: -1 })
+        .lean(),
     );
 
-    const totals = await queryOne(
-      `SELECT
-         COALESCE(SUM(amount),0) AS total,
-         COALESCE(SUM(CASE WHEN date_trunc('month',paid_on)=date_trunc('month',CURRENT_DATE) THEN amount ELSE 0 END),0) AS this_month
-       FROM payments WHERE user_id = $1`,
-      [req.user.id],
+    const invoices = clean(
+      await Invoice.find({ _id: { $in: rows.map((p) => p.invoice_id) } })
+        .select("invoice_number total client_id")
+        .lean(),
     );
+    await attachClients(invoices);
+    const invById = new Map(invoices.map((i) => [i.id, i]));
+
+    const thisMonth = monthKey(todayStr());
+    const total = rows.reduce((s, p) => s + num(p.amount), 0);
+    const monthTotal = rows
+      .filter((p) => p.paid_on.slice(0, 7) === thisMonth)
+      .reduce((s, p) => s + num(p.amount), 0);
 
     res.json({
-      payments: rows.map((p) => ({
-        ...p,
-        amount: num(p.amount),
-        invoice_total: num(p.invoice_total),
-      })),
-      totals: { total: num(totals.total), thisMonth: num(totals.this_month) },
+      payments: rows.map((p) => {
+        const inv = invById.get(p.invoice_id);
+        return {
+          ...p,
+          amount: num(p.amount),
+          invoice_number: inv ? inv.invoice_number : null,
+          invoice_total: inv ? num(inv.total) : 0,
+          client_name: inv ? inv.client_name : null,
+        };
+      }),
+      totals: { total: round2(total), thisMonth: round2(monthTotal) },
     });
   }),
 );
@@ -89,32 +96,21 @@ router.post(
   validate(paymentSchema),
   asyncHandler(async (req, res) => {
     const b = req.body;
-    const invoice = await queryOne(
-      `SELECT id FROM invoices WHERE id = $1 AND user_id = $2`,
-      [b.invoiceId, req.user.id],
-    );
+    const invoice = await Invoice.exists({ _id: b.invoiceId, user_id: req.user.id });
     if (!invoice) throw ApiError.notFound("Invoice not found");
 
-    const payment = await withTransaction(async (client) => {
-      const { rows } = await client.query(
-        `INSERT INTO payments (user_id, invoice_id, amount, method, paid_on, notes)
-         VALUES ($1,$2,$3,$4,COALESCE($5, CURRENT_DATE),$6) RETURNING *`,
-        [
-          req.user.id,
-          b.invoiceId,
-          b.amount,
-          b.method || "",
-          b.paid_on || null,
-          b.notes || "",
-        ],
-      );
-      await reconcileInvoice(client, b.invoiceId);
-      return rows[0];
+    const doc = await Payment.create({
+      user_id: req.user.id,
+      invoice_id: b.invoiceId,
+      amount: b.amount,
+      method: b.method || "",
+      paid_on: b.paid_on || todayStr(),
+      notes: b.notes || "",
     });
+    await reconcileInvoice(b.invoiceId);
 
-    res
-      .status(201)
-      .json({ payment: { ...payment, amount: num(payment.amount) } });
+    const payment = clean(doc.toObject());
+    res.status(201).json({ payment: { ...payment, amount: num(payment.amount) } });
   }),
 );
 
@@ -122,16 +118,11 @@ router.delete(
   "/:id",
   validate(idParam, "params"),
   asyncHandler(async (req, res) => {
-    const existing = await queryOne(
-      `SELECT invoice_id FROM payments WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.user.id],
-    );
+    const existing = await Payment.findOne({ _id: req.params.id, user_id: req.user.id }).lean();
     if (!existing) throw ApiError.notFound("Payment not found");
 
-    await withTransaction(async (client) => {
-      await client.query(`DELETE FROM payments WHERE id = $1`, [req.params.id]);
-      await reconcileInvoice(client, existing.invoice_id);
-    });
+    await Payment.deleteOne({ _id: existing._id });
+    await reconcileInvoice(existing.invoice_id);
 
     res.json({ ok: true });
   }),

@@ -5,13 +5,15 @@ const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { requireAuth } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
-const { query, queryOne } = require("../config/db");
+const { Client, Invoice } = require("../models");
+const { clean } = require("../utils/serialize");
+const { objectId } = require("../utils/ids");
+const { round2 } = require("../utils/invoice");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const uuid = z.string().uuid("Invalid id");
-const idParam = z.object({ id: uuid });
+const idParam = z.object({ id: objectId });
 
 const clientSchema = z.object({
   name: z.string().trim().min(1).max(120),
@@ -22,26 +24,38 @@ const clientSchema = z.object({
   notes: z.string().trim().max(2000).optional(),
 });
 
+const FIELDS = ["name", "email", "company", "phone", "address", "notes"];
+
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { rows } = await query(
-      `SELECT c.*,
-         COUNT(i.id)::int AS invoice_count,
-         COALESCE(SUM(i.total), 0) AS total_billed,
-         COALESCE(SUM(CASE WHEN i.status <> 'paid' THEN i.total ELSE 0 END), 0) AS outstanding
-       FROM clients c
-       LEFT JOIN invoices i ON i.client_id = c.id
-       WHERE c.user_id = $1
-       GROUP BY c.id
-       ORDER BY c.created_at DESC`,
-      [req.user.id],
-    );
-    const clients = rows.map((r) => ({
-      ...r,
-      total_billed: Number(r.total_billed),
-      outstanding: Number(r.outstanding),
-    }));
+    const uid = req.user.id;
+    const [rows, invoices] = await Promise.all([
+      Client.find({ user_id: uid }).sort({ created_at: -1 }).lean(),
+      Invoice.find({ user_id: uid, client_id: { $ne: null } })
+        .select("client_id status total")
+        .lean(),
+    ]);
+
+    const stats = new Map();
+    for (const inv of invoices) {
+      const key = String(inv.client_id);
+      const s = stats.get(key) || { invoice_count: 0, total_billed: 0, outstanding: 0 };
+      s.invoice_count += 1;
+      s.total_billed += inv.total || 0;
+      if (inv.status !== "paid") s.outstanding += inv.total || 0;
+      stats.set(key, s);
+    }
+
+    const clients = clean(rows).map((c) => {
+      const s = stats.get(c.id) || { invoice_count: 0, total_billed: 0, outstanding: 0 };
+      return {
+        ...c,
+        invoice_count: s.invoice_count,
+        total_billed: round2(s.total_billed),
+        outstanding: round2(s.outstanding),
+      };
+    });
     res.json({ clients });
   }),
 );
@@ -50,17 +64,14 @@ router.get(
   "/:id",
   validate(idParam, "params"),
   asyncHandler(async (req, res) => {
-    const client = await queryOne(
-      `SELECT * FROM clients WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.user.id],
-    );
+    const client = await Client.findOne({ _id: req.params.id, user_id: req.user.id }).lean();
     if (!client) throw ApiError.notFound("Client not found");
 
-    const { rows: invoices } = await query(
-      `SELECT id, invoice_number, status, issue_date, due_date, total, currency, created_at
-       FROM invoices WHERE client_id = $1 AND user_id = $2
-       ORDER BY issue_date DESC, created_at DESC`,
-      [req.params.id, req.user.id],
+    const invoices = clean(
+      await Invoice.find({ client_id: req.params.id, user_id: req.user.id })
+        .select("invoice_number status issue_date due_date total currency created_at")
+        .sort({ issue_date: -1, created_at: -1 })
+        .lean(),
     );
 
     const totalBilled = invoices.reduce((s, i) => s + Number(i.total), 0);
@@ -69,7 +80,7 @@ router.get(
       .reduce((s, i) => s + Number(i.total), 0);
 
     res.json({
-      client,
+      client: clean(client),
       invoices: invoices.map((i) => ({ ...i, total: Number(i.total) })),
       stats: { totalBilled, outstanding, count: invoices.length },
     });
@@ -81,20 +92,16 @@ router.post(
   validate(clientSchema),
   asyncHandler(async (req, res) => {
     const b = req.body;
-    const client = await queryOne(
-      `INSERT INTO clients (user_id, name, email, company, phone, address, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [
-        req.user.id,
-        b.name,
-        b.email || "",
-        b.company || "",
-        b.phone || "",
-        b.address || "",
-        b.notes || "",
-      ],
-    );
-    res.status(201).json({ client });
+    const doc = await Client.create({
+      user_id: req.user.id,
+      name: b.name,
+      email: b.email || "",
+      company: b.company || "",
+      phone: b.phone || "",
+      address: b.address || "",
+      notes: b.notes || "",
+    });
+    res.status(201).json({ client: clean(doc.toObject()) });
   }),
 );
 
@@ -103,24 +110,17 @@ router.patch(
   validate(idParam, "params"),
   validate(clientSchema.partial()),
   asyncHandler(async (req, res) => {
-    const fields = ["name", "email", "company", "phone", "address", "notes"];
-    const sets = [];
-    const values = [req.params.id, req.user.id];
-    for (const f of fields) {
-      if (req.body[f] !== undefined) {
-        values.push(req.body[f]);
-        sets.push(`${f} = $${values.length}`);
-      }
-    }
-    if (!sets.length) throw ApiError.badRequest("No fields to update");
+    const set = {};
+    for (const f of FIELDS) if (req.body[f] !== undefined) set[f] = req.body[f];
+    if (!Object.keys(set).length) throw ApiError.badRequest("No fields to update");
 
-    const client = await queryOne(
-      `UPDATE clients SET ${sets.join(", ")}, updated_at = now()
-       WHERE id = $1 AND user_id = $2 RETURNING *`,
-      values,
-    );
+    const client = await Client.findOneAndUpdate(
+      { _id: req.params.id, user_id: req.user.id },
+      { $set: set },
+      { new: true },
+    ).lean();
     if (!client) throw ApiError.notFound("Client not found");
-    res.json({ client });
+    res.json({ client: clean(client) });
   }),
 );
 
@@ -128,11 +128,13 @@ router.delete(
   "/:id",
   validate(idParam, "params"),
   asyncHandler(async (req, res) => {
-    const result = await query(
-      `DELETE FROM clients WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.user.id],
+    const result = await Client.deleteOne({ _id: req.params.id, user_id: req.user.id });
+    if (!result.deletedCount) throw ApiError.notFound("Client not found");
+    // same as ON DELETE SET NULL
+    await Invoice.updateMany(
+      { client_id: req.params.id, user_id: req.user.id },
+      { $set: { client_id: null } },
     );
-    if (!result.rowCount) throw ApiError.notFound("Client not found");
     res.json({ ok: true });
   }),
 );

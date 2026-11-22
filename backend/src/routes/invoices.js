@@ -5,15 +5,17 @@ const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { requireAuth } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
-const { query, queryOne, withTransaction } = require("../config/db");
+const { Invoice, Client, Payment } = require("../models");
 const Settings = require("../models/Settings");
-const { computeTotals, serializeInvoice } = require("../utils/invoice");
+const { clean } = require("../utils/serialize");
+const { objectId, isValidId, escapeRegex } = require("../utils/ids");
+const { todayStr } = require("../utils/dates");
+const { computeTotals, serializeInvoice, attachClients } = require("../utils/invoice");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const uuid = z.string().uuid("Invalid id");
-const idParam = z.object({ id: uuid });
+const idParam = z.object({ id: objectId });
 const dateStr = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD")
@@ -25,107 +27,84 @@ const itemSchema = z.object({
   rate: z.coerce.number().min(0).max(100_000_000).default(0),
 });
 
-const invoiceSchema = z.object({
-  client_id: uuid.nullish(),
+// Fields without defaults (used as-is for PATCH so omitted fields stay untouched)
+const invoiceFields = {
+  client_id: objectId.nullish(),
   invoice_number: z.string().trim().max(40).optional(),
-  status: z.enum(["draft", "sent", "paid"]).default("draft"),
+  status: z.enum(["draft", "sent", "paid"]),
   issue_date: dateStr,
   due_date: dateStr,
-  currency: z.string().trim().max(8).default("USD"),
-  tax_rate: z.coerce.number().min(0).max(100).default(0),
-  discount: z.coerce.number().min(0).max(100_000_000).default(0),
-  notes: z.string().trim().max(4000).default(""),
-  terms: z.string().trim().max(2000).default(""),
-  items: z.array(itemSchema).default([]),
+  currency: z.string().trim().max(8),
+  tax_rate: z.coerce.number().min(0).max(100),
+  discount: z.coerce.number().min(0).max(100_000_000),
+  notes: z.string().trim().max(4000),
+  terms: z.string().trim().max(2000),
+  items: z.array(itemSchema),
+};
+
+const invoiceSchema = z.object({
+  ...invoiceFields,
+  status: invoiceFields.status.default("draft"),
+  currency: invoiceFields.currency.default("USD"),
+  tax_rate: invoiceFields.tax_rate.default(0),
+  discount: invoiceFields.discount.default(0),
+  notes: invoiceFields.notes.default(""),
+  terms: invoiceFields.terms.default(""),
+  items: invoiceFields.items.default([]),
 });
 
-async function loadInvoice(userId, id) {
-  const invoice = await queryOne(
-    `SELECT i.*, c.name AS client_name, c.email AS client_email,
-            c.company AS client_company, c.address AS client_address
-     FROM invoices i
-     LEFT JOIN clients c ON c.id = i.client_id
-     WHERE i.id = $1 AND i.user_id = $2`,
-    [id, userId],
-  );
-  if (!invoice) throw ApiError.notFound("Invoice not found");
-  const { rows: items } = await query(
-    `SELECT id, description, quantity, rate, amount, position
-     FROM invoice_items WHERE invoice_id = $1 ORDER BY position ASC`,
-    [id],
-  );
-  return serializeInvoice(invoice, items);
-}
+const invoicePatchSchema = z.object(invoiceFields).partial();
 
-async function replaceItems(client, invoiceId, items) {
-  await client.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [
-    invoiceId,
-  ]);
-  for (const it of items) {
-    await client.query(
-      `INSERT INTO invoice_items (invoice_id, description, quantity, rate, amount, position)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [invoiceId, it.description, it.quantity, it.rate, it.amount, it.position],
-    );
-  }
+async function loadInvoice(userId, id) {
+  const row = await Invoice.findOne({ _id: id, user_id: userId }).lean();
+  if (!row) throw ApiError.notFound("Invoice not found");
+  const [invoice] = await attachClients([clean(row)], { full: true });
+  return serializeInvoice(invoice, true);
 }
 
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const {
-      status,
-      client_id,
-      search,
-      sort = "issue_date",
-      order = "desc",
-    } = req.query;
+    const { status, client_id, search, sort = "issue_date", order = "desc" } = req.query;
 
-    const params = [req.user.id];
-    const where = ["i.user_id = $1"];
+    const filter = { user_id: req.user.id };
+    const and = [];
+    const today = todayStr();
 
     if (client_id) {
-      params.push(client_id);
-      where.push(`i.client_id = $${params.length}`);
+      if (!isValidId(client_id)) throw ApiError.badRequest("Invalid client_id");
+      filter.client_id = client_id;
     }
+
     if (status && status !== "all") {
       if (status === "overdue") {
-        where.push(`i.status = 'sent' AND i.due_date < CURRENT_DATE`);
+        filter.status = "sent";
+        filter.due_date = { $lt: today };
       } else if (status === "sent") {
-        where.push(
-          `i.status = 'sent' AND (i.due_date IS NULL OR i.due_date >= CURRENT_DATE)`,
-        );
+        filter.status = "sent";
+        and.push({ $or: [{ due_date: null }, { due_date: { $gte: today } }] });
       } else {
-        params.push(status);
-        where.push(`i.status = $${params.length}`);
+        filter.status = String(status);
       }
     }
+
     if (search) {
-      params.push(`%${search}%`);
-      where.push(
-        `(i.invoice_number ILIKE $${params.length} OR c.name ILIKE $${params.length})`,
-      );
+      const re = new RegExp(escapeRegex(String(search)), "i");
+      const clientIds = await Client.find({ user_id: req.user.id, name: re }).distinct("_id");
+      and.push({ $or: [{ invoice_number: re }, { client_id: { $in: clientIds } }] });
     }
+    if (and.length) filter.$and = and;
 
-    const sortCol =
-      {
-        issue_date: "i.issue_date",
-        total: "i.total",
-        due_date: "i.due_date",
-        created_at: "i.created_at",
-      }[sort] || "i.issue_date";
-    const sortDir = order === "asc" ? "ASC" : "DESC";
+    const sortCol = ["issue_date", "total", "due_date", "created_at"].includes(sort)
+      ? sort
+      : "issue_date";
+    const sortSpec = { [sortCol]: order === "asc" ? 1 : -1 };
+    if (sortCol !== "created_at") sortSpec.created_at = -1;
 
-    const { rows } = await query(
-      `SELECT i.*, c.name AS client_name, c.company AS client_company
-       FROM invoices i
-       LEFT JOIN clients c ON c.id = i.client_id
-       WHERE ${where.join(" AND ")}
-       ORDER BY ${sortCol} ${sortDir}, i.created_at DESC`,
-      params,
-    );
+    const rows = await Invoice.find(filter).sort(sortSpec).lean();
+    const invoices = await attachClients(clean(rows));
 
-    res.json({ invoices: rows.map((r) => serializeInvoice(r)) });
+    res.json({ invoices: invoices.map((r) => serializeInvoice(r)) });
   }),
 );
 
@@ -143,109 +122,87 @@ router.post(
   validate(invoiceSchema),
   asyncHandler(async (req, res) => {
     const b = req.body;
-    const totals = computeTotals(b.items, b.tax_rate, b.discount);
-    const invoiceNumber =
-      b.invoice_number || (await Settings.nextInvoiceNumber(req.user.id));
 
-    const invoice = await withTransaction(async (client) => {
-      const { rows } = await client.query(
-        `INSERT INTO invoices
-         (user_id, client_id, invoice_number, status, issue_date, due_date,
-          currency, tax_rate, discount, subtotal, tax_amount, total, notes, terms, paid_at)
-         VALUES ($1,$2,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-         RETURNING *`,
-        [
-          req.user.id,
-          b.client_id || null,
-          invoiceNumber,
-          b.status,
-          b.issue_date || null,
-          b.due_date || null,
-          b.currency,
-          b.tax_rate,
-          totals.discount,
-          totals.subtotal,
-          totals.taxAmount,
-          totals.total,
-          b.notes,
-          b.terms,
-          b.status === "paid" ? new Date() : null,
-        ],
-      );
-      await replaceItems(client, rows[0].id, totals.items);
-      return rows[0];
+    if (b.client_id) {
+      const owns = await Client.exists({ _id: b.client_id, user_id: req.user.id });
+      if (!owns) throw ApiError.badRequest("Referenced record does not exist");
+    }
+
+    const totals = computeTotals(b.items, b.tax_rate, b.discount);
+    const invoiceNumber = b.invoice_number || (await Settings.nextInvoiceNumber(req.user.id));
+
+    const doc = await Invoice.create({
+      user_id: req.user.id,
+      client_id: b.client_id || null,
+      invoice_number: invoiceNumber,
+      status: b.status,
+      issue_date: b.issue_date || todayStr(),
+      due_date: b.due_date || null,
+      currency: b.currency,
+      tax_rate: b.tax_rate,
+      discount: totals.discount,
+      subtotal: totals.subtotal,
+      tax_amount: totals.taxAmount,
+      total: totals.total,
+      notes: b.notes,
+      terms: b.terms,
+      paid_at: b.status === "paid" ? new Date() : null,
+      items: totals.items,
     });
 
-    res
-      .status(201)
-      .json({ invoice: await loadInvoice(req.user.id, invoice.id) });
+    res.status(201).json({ invoice: await loadInvoice(req.user.id, doc._id) });
   }),
 );
 
 router.patch(
   "/:id",
   validate(idParam, "params"),
-  validate(invoiceSchema.partial()),
+  validate(invoicePatchSchema),
   asyncHandler(async (req, res) => {
-    const existing = await queryOne(
-      `SELECT * FROM invoices WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.user.id],
-    );
+    const existing = await Invoice.findOne({ _id: req.params.id, user_id: req.user.id }).lean();
     if (!existing) throw ApiError.notFound("Invoice not found");
 
     const b = req.body;
     const taxRate = b.tax_rate ?? Number(existing.tax_rate);
     const discount = b.discount ?? Number(existing.discount);
 
-    await withTransaction(async (client) => {
-      let totals = null;
-      if (b.items) totals = computeTotals(b.items, taxRate, discount);
-      else if (b.tax_rate !== undefined || b.discount !== undefined) {
-        const { rows: curItems } = await client.query(
-          `SELECT description, quantity, rate FROM invoice_items WHERE invoice_id = $1 ORDER BY position`,
-          [existing.id],
-        );
-        totals = computeTotals(curItems, taxRate, discount);
-      }
+    if (b.client_id) {
+      const owns = await Client.exists({ _id: b.client_id, user_id: req.user.id });
+      if (!owns) throw ApiError.badRequest("Referenced record does not exist");
+    }
 
-      const sets = [];
-      const values = [existing.id];
-      const set = (col, val) => {
-        values.push(val);
-        sets.push(`${col} = $${values.length}`);
-      };
+    let totals = null;
+    if (b.items) totals = computeTotals(b.items, taxRate, discount);
+    else if (b.tax_rate !== undefined || b.discount !== undefined) {
+      totals = computeTotals(existing.items || [], taxRate, discount);
+    }
 
-      if (b.client_id !== undefined) set("client_id", b.client_id || null);
-      if (b.invoice_number !== undefined)
-        set("invoice_number", b.invoice_number);
-      if (b.status !== undefined) {
-        set("status", b.status);
-        set("paid_at", b.status === "paid" ? new Date() : null);
-      }
-      if (b.issue_date !== undefined) set("issue_date", b.issue_date);
-      if (b.due_date !== undefined) set("due_date", b.due_date || null);
-      if (b.currency !== undefined) set("currency", b.currency);
-      if (b.notes !== undefined) set("notes", b.notes);
-      if (b.terms !== undefined) set("terms", b.terms);
-      if (totals) {
-        set("tax_rate", taxRate);
-        set("discount", totals.discount);
-        set("subtotal", totals.subtotal);
-        set("tax_amount", totals.taxAmount);
-        set("total", totals.total);
-      }
+    const set = {};
+    if (b.client_id !== undefined) set.client_id = b.client_id || null;
+    if (b.invoice_number !== undefined) set.invoice_number = b.invoice_number;
+    if (b.status !== undefined) {
+      set.status = b.status;
+      set.paid_at = b.status === "paid" ? new Date() : null;
+    }
+    if (b.issue_date !== undefined) set.issue_date = b.issue_date;
+    if (b.due_date !== undefined) set.due_date = b.due_date || null;
+    if (b.currency !== undefined) set.currency = b.currency;
+    if (b.notes !== undefined) set.notes = b.notes;
+    if (b.terms !== undefined) set.terms = b.terms;
+    if (totals) {
+      set.tax_rate = taxRate;
+      set.discount = totals.discount;
+      set.subtotal = totals.subtotal;
+      set.tax_amount = totals.taxAmount;
+      set.total = totals.total;
+      if (b.items) set.items = totals.items;
+    }
 
-      if (sets.length) {
-        await client.query(
-          `UPDATE invoices SET ${sets.join(", ")}, updated_at = now() WHERE id = $1`,
-          values,
-        );
-      }
-      if (totals && b.items)
-        await replaceItems(client, existing.id, totals.items);
-    });
+    if (Object.keys(set).length) {
+      await Invoice.updateOne({ _id: existing._id }, { $set: set });
+    }
 
-    res.json({ invoice: await loadInvoice(req.user.id, existing.id) });
+    res.json({ invoice: await loadInvoice(req.user.id, existing._id) });
   }),
 );
 
@@ -255,17 +212,11 @@ router.patch(
   validate(z.object({ status: z.enum(["draft", "sent", "paid"]) })),
   asyncHandler(async (req, res) => {
     const { status } = req.body;
-    const updated = await queryOne(
-      `UPDATE invoices
-       SET status = $3, paid_at = $4, updated_at = now()
-       WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [
-        req.params.id,
-        req.user.id,
-        status,
-        status === "paid" ? new Date() : null,
-      ],
-    );
+    const updated = await Invoice.findOneAndUpdate(
+      { _id: req.params.id, user_id: req.user.id },
+      { $set: { status, paid_at: status === "paid" ? new Date() : null } },
+      { new: true },
+    ).lean();
     if (!updated) throw ApiError.notFound("Invoice not found");
     res.json({ invoice: await loadInvoice(req.user.id, req.params.id) });
   }),
@@ -275,11 +226,10 @@ router.delete(
   "/:id",
   validate(idParam, "params"),
   asyncHandler(async (req, res) => {
-    const result = await query(
-      `DELETE FROM invoices WHERE id = $1 AND user_id = $2`,
-      [req.params.id, req.user.id],
-    );
-    if (!result.rowCount) throw ApiError.notFound("Invoice not found");
+    const result = await Invoice.deleteOne({ _id: req.params.id, user_id: req.user.id });
+    if (!result.deletedCount) throw ApiError.notFound("Invoice not found");
+    // same as ON DELETE CASCADE
+    await Payment.deleteMany({ invoice_id: req.params.id });
     res.json({ ok: true });
   }),
 );
